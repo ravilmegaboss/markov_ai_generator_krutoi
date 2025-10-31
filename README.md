@@ -1,0 +1,1 @@
+# markov_ai_generator_krutoi
