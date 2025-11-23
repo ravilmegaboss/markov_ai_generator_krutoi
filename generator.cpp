@@ -4,10 +4,7 @@
 #include <bits/stdc++.h> //подключаю все 
 using namespace std;
 
-// ===================================================
-// float16 > float32
-// ===================================================
-//плюсы не умеют работать с float16, поэтому раскладываем 16б число в 32б число воооот
+//плюсы не умеют работать с float16, поэтому раскладываем 16б число в 32б число воооот(оказалось умеют в c++23)
 float h2f(uint16_t h) {
     uint32_t sign = (h & 0x8000) << 16;
     uint32_t exp  = (h >> 10) & 0x1F;
@@ -28,10 +25,6 @@ float h2f(uint16_t h) {
     }
     float f; memcpy(&f, &bits, sizeof(f)); return f;
 }
-
-// ===================================================
-// utf8
-// ===================================================
 
 static void a_cp_utf8(string &out, uint32_t cp) { //берет юникод код и добавляет в строку в виде utf байтов
     if (cp <= 0x7F) out.push_back((char)cp);
@@ -63,10 +56,9 @@ static string unicode_to_utf(const string &s) {//конвертируем код
     return out;
 }
 
-// ===================================================
-// нормализация нашего родного руского языка
-// ===================================================
-string normalize_utf8(const string &s) {
+// нормализация руского языка
+
+tring normalize_utf8(const string &s) {
     string result;
     const unsigned char *p = (const unsigned char*)s.data();
     size_t i = 0;
@@ -92,58 +84,138 @@ string normalize_utf8(const string &s) {
     }
     return result;
 }
-// ===================================================
+
 // загрузка модели
-// ===================================================
-//по своей сути сердце модели. парсинг делается ручками билла гейтса при вызове))) чтобы было быстрее
+//тут немножко повайбкодил, не мог придумать как ускорить
 unordered_map<string, vector<pair<string,float>>> load_model(const string &filename) {
-    ifstream in(filename, ios::binary);
-    if (!in) {
+#ifdef _WIN32
+    HANDLE hFile = CreateFileA(filename.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
         cerr << "error: cannot open " << filename << endl;
         exit(1);
     }
-    string json((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+    LARGE_INTEGER filesize_li;
+    if (!GetFileSizeEx(hFile, &filesize_li) || filesize_li.QuadPart == 0) {
+        CloseHandle(hFile);
+        cerr << "error: cannot stat " << filename << endl;
+        exit(1);
+    }
+    size_t filesize = (size_t)filesize_li.QuadPart;
+    HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!hMap) { CloseHandle(hFile); cerr << "error: cannot map " << filename << endl; exit(1); }
+    const char *data = (const char*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!data) { CloseHandle(hMap); CloseHandle(hFile); cerr << "error: cannot map view " << filename << endl; exit(1); }
+#else
+    #include <sys/mman.h>
+    #include <sys/stat.h>
+    #include <fcntl.h>
+    #include <unistd.h>
+    int fd = open(filename.c_str(), O_RDONLY);
+    if (fd == -1) { cerr << "error: cannot open " << filename << endl; exit(1); }
+    struct stat st;
+    if (fstat(fd, &st) == -1 || st.st_size == 0) { close(fd); cerr << "error: cannot stat " << filename << endl; exit(1); }
+    size_t filesize = (size_t)st.st_size;
+    const char *data = (const char*)mmap(nullptr, filesize, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (data == MAP_FAILED) { close(fd); cerr << "error: mmap failed " << filename << endl; exit(1); }
+#endif
+
+    const char *p = data;
+    const char *end = data + filesize;
     unordered_map<string, vector<pair<string,float>>> model;
-    size_t pos = 0;
+    model.reserve(100000);
+
+    auto parse_quoted = [&](const char *&it)->string {
+
+        ++it;
+        const char *start = it;
+        string out;
+        while (it < end) {
+            if (*it == '\\') {
+                out.append(start, it - start);
+                if (it + 1 < end) {
+                    out.push_back(*it); // '\'
+                    out.push_back(*(it + 1));
+                    it += 2;
+                    start = it;
+                } else { ++it; start = it; }
+            } else if (*it == '"') {
+                out.append(start, it - start);
+                ++it;
+                return out;
+            } else ++it;
+        }
+        return out;
+    };
+
+    auto skip_to = [&](char ch) {
+        while (p < end && *p != ch) ++p;
+    };
 
     while (true) {
-        size_t q = json.find('"', pos); if (q == string::npos) break;
-        size_t q2 = json.find('"', q+1); if (q2 == string::npos) break;
-        string context = unicode_to_utf(json.substr(q+1, q2-q-1));
+        // поиск следующей контекстной строки
+        skip_to('"');
+        if (p >= end) break;
+        string context_raw = parse_quoted(p);
+        if (context_raw.empty() && p >= end) break;
+        string context = unicode_to_utf(context_raw);
 
-        size_t b1 = json.find('{', q2); if (b1 == string::npos) break;
-        size_t b2 = json.find('}', b1); if (b2 == string::npos) break;
-        string inside = json.substr(b1+1, b2-b1-1);
+        // поиск открывающей скобки для объекта с парами ключ:число
+        skip_to('{');
+        if (p >= end) break;
+        ++p; // ввод объекта
 
-        size_t p = 0;
-        while (true) {
-            size_t k1 = inside.find('"', p); if (k1 == string::npos) break;
-            size_t k2 = inside.find('"', k1+1); if (k2 == string::npos) break;
-            string key = unicode_to_utf(inside.substr(k1+1, k2-k1-1));
+        // парсинг пар ключ:число внутри объекта
+        while (p < end) {
+            // пропуск пробелов и переход к ключу или закрывающей скобке
+            while (p < end && (unsigned char)*p <= 32) ++p;
+            if (p >= end) break;
+            if (*p == '}') { ++p; break; }
+            if (*p != '"') {
+                skip_to('"');
+                if (p >= end) break;
+            }
+            string key_raw = parse_quoted(p);
+            string key = unicode_to_utf(key_raw);
 
-            size_t colon = inside.find(':', k2);
-            if (colon == string::npos) break;
-            size_t numstart = colon+1;
-            while (numstart < inside.size() && isspace((unsigned char)inside[numstart])) numstart++;
-            size_t numend = numstart;
-            while (numend < inside.size() && isdigit((unsigned char)inside[numend])) numend++;
-            if (numend == numstart) break;
-
-            uint16_t half = (uint16_t)stoul(inside.substr(numstart, numend-numstart));
+            // переход к двоеточию
+            while (p < end && *p != ':') ++p;
+            if (p >= end) break;
+            ++p;
+            // пропуск пробелов
+            while (p < end && (unsigned char)*p <= 32) ++p;
+            // парсинг чисел
+            const char *numstart = p;
+            while (p < end && isdigit((unsigned char)*p)) ++p;
+            if (numstart == p) break;
+            // конвертация в uint16_t 
+            uint32_t val = 0;
+            for (const char *q = numstart; q < p; ++q) val = val * 10u + (uint32_t)(*q - '0');
+            uint16_t half = (uint16_t)val;
             float prob = h2f(half);
-            model[context].push_back({key, prob});
 
-            size_t comma = inside.find(',', numend);
-            if (comma == string::npos) break;
-            p = comma + 1;
+            // вставка
+            auto &vec = model[context];
+            vec.emplace_back(std::move(key), prob);
+
+            // пропуск пробелов и переход к запятой или закрывающей скобке
+            while (p < end && (unsigned char)*p <= 32) ++p;
+            if (p < end && *p == ',') { ++p; continue; }
+            if (p < end && *p == '}') { ++p; break; }
         }
-
-        pos = b2 + 1;
     }
+
+    // unmap и close
+#ifdef _WIN32
+    UnmapViewOfFile(data);
+    CloseHandle(hMap);
+    CloseHandle(hFile);
+#else
+    munmap((void*)data, filesize);
+    close(fd);
+#endif
 
     return model;
 }
-
 
 // берем последние k символов. вывод если брать байты примерно такой: фвтыамл
 string last_k_utf8(const string &s, int k) {
@@ -169,52 +241,93 @@ string last_k_utf8(const string &s, int k) {
     return ctx;
 }
 
-// ===================================================
-// ^_^ Генерация ^_^
-// ===================================================
-string choose_next(const vector<pair<string,float>> &opts, float temperature) {
-    if (opts.empty()) return "";
-    vector<float> adjusted;
-    adjusted.reserve(opts.size());
-    float sum = 0;
-    for (auto &p : opts) {
-        float val = pow(p.second, 1.0f / max(temperature, 0.01f));
-        adjusted.push_back(val);
-        sum += val;
+// choose_next: возвращает следующий элемент из opts с вероятностями
+
+static const string& choose_next(const vector<pair<string,float>> &opts, float temperature) {
+    static const string EMPTY;
+    if (opts.empty()) return EMPTY;
+
+    static thread_local std::mt19937 rng((unsigned)time(nullptr));
+
+    float temp = max(temperature, 0.01f);
+    float exp_inv = 1.0f / temp;
+
+    size_t m = opts.size();
+    static thread_local vector<float> cum; // буффер
+    cum.assign(m, 0.0f);
+
+    // вычисление скорректированных весов и накопительной суммы
+    float s = 0.0f;
+    for (size_t i = 0; i < m; ++i) {
+        float w = std::pow(opts[i].second, exp_inv);
+        s += w;
+        cum[i] = s;
     }
 
-    float r = ((float)rand() / RAND_MAX) * sum;
-    float cum = 0;
-    for (size_t i = 0; i < opts.size(); i++) {
-        cum += adjusted[i];
-        if (r <= cum) return opts[i].first;
-    }
-    return opts.back().first;
+    if (s <= 0.0f) return opts.back().first;
+
+    std::uniform_real_distribution<float> dist(0.0f, s);
+    float r = dist(rng);
+
+    // бинарный поиск индекса
+    auto it = std::upper_bound(cum.begin(), cum.end(), r);
+    size_t idx = (it == cum.end()) ? (m - 1) : (size_t)(it - cum.begin());
+    return opts[idx].first;
 }
+
 string generate_text(const unordered_map<string, vector<pair<string,float>>> &model,
                      string seed, int n, int len, float temperature) {
     string res = seed;
-    for (int i = 0; i < len; i++) {
-        string next;
+
+    // поддерживаем позиции начала UTF-8 символов в res для быстрого формирования суффиксных контекстов
+    vector<size_t> char_pos;
+    char_pos.reserve(res.size() / 2 + 8);
+    for (size_t i = 0; i < res.size(); ++i) {
+        unsigned char c = (unsigned char)res[i];
+        // байты продолжения имеют формат 10xxxxxx (0x80..0xBF)
+        if ((c & 0xC0) != 0x80) char_pos.push_back(i);
+    }
+
+    for (int step = 0; step < len; ++step) {
         bool found = false;
-        for (int k = n; k >= 1; k--) {
-            string ctx = last_k_utf8(res, k);
+        const string *chosen_ptr = nullptr;
+
+        for (int k = n; k >= 1; --k) {
+            string ctx;
+            if ((int)char_pos.size() >= k) {
+                size_t start = char_pos[char_pos.size() - k];
+                ctx = res.substr(start);
+            } else {
+                ctx = res;
+            }
+
             auto it = model.find(ctx);
             if (it != model.end() && !it->second.empty()) {
-                next = choose_next(it->second, temperature);
+                const string &ch = choose_next(it->second, temperature);
+                if (ch.empty()) { found = false; break; }
+                chosen_ptr = &ch;
                 found = true;
                 break;
             }
         }
-        if (!found) break;
+
+        if (!found || !chosen_ptr) break;
+
+        const string &next = *chosen_ptr;
+        // добавляем и обновляем char_pos новыми позициями начала символов
+        size_t base = res.size();
         res += next;
+        for (size_t j = 0; j < next.size(); ++j) {
+            unsigned char c = (unsigned char)next[j];
+            if ((c & 0xC0) != 0x80) char_pos.push_back(base + j);
+        }
     }
+
     return res;
 }
 
-// ===================================================
+
 // MAIN
-// ====================================================
 int main(int argc, char* argv[]) {
     srand(time(nullptr));
 #ifdef _WIN32
@@ -254,7 +367,7 @@ int main(int argc, char* argv[]) {
     cerr << "seed after normalization: " << seed << endl;
 
     int n = 5, len = 200;
-    float temperature = 1.0;
+    float temperature = 1;
     for (int i = 2; i < argc; i++) {
         string a = argv[i];
         if (a == "--n" && i + 1 < argc) n = stoi(argv[++i]);
