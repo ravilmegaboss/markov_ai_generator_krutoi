@@ -58,7 +58,7 @@ static string unicode_to_utf(const string &s) {//конвертируем код
 
 // нормализация руского языка
 
-tring normalize_utf8(const string &s) {
+string normalize_utf8(const string &s) {
     string result;
     const unsigned char *p = (const unsigned char*)s.data();
     size_t i = 0;
